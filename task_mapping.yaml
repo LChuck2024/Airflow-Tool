@@ -1,0 +1,11 @@
+mappings:
+  - dag_id: example_dag
+    task_id: extract_customer
+    owner: data_team
+    domain: customer
+    criticality: high
+  - dag_id: example_dag
+    task_id: transform_customer
+    owner: data_team
+    domain: customer
+    criticality: medium

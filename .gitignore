@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+# SQLite 辅助文件（若出现）
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 本地运行时数据库（勿提交；交付时也不分发）
+airflow_metrics.db
+
+# 导出数据（若有）
+data/*.csv

@@ -1,0 +1,7 @@
+pandas
+requests
+sqlalchemy
+python-dotenv
+streamlit
+plotly
+pyyaml
