@@ -402,7 +402,7 @@ def main() -> None:
                         }
                     )
                     .sort_values("波动系数(稳定性指标)", ascending=False),
-                    use_container_width=True,
+                    width="stretch",
                     height=320,
                 )
                 st.caption(
@@ -425,7 +425,7 @@ def main() -> None:
                     paper_bgcolor="rgba(255,255,255,0.98)",
                     plot_bgcolor="rgba(255,255,255,0.98)",
                 )
-                st.plotly_chart(vol_fig, use_container_width=True)
+                st.plotly_chart(vol_fig, width="stretch")
 
         bar_data = (
             filtered.groupby(["dag_id", "task_id"], as_index=False)["duration_min"]
@@ -455,7 +455,7 @@ def main() -> None:
             paper_bgcolor="rgba(255,255,255,0.98)",
             plot_bgcolor="rgba(255,255,255,0.98)",
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width="stretch")
 
         line_data = (
             filtered.groupby("run_day", as_index=False)["duration_min"]
@@ -478,7 +478,7 @@ def main() -> None:
             plot_bgcolor="rgba(255,255,255,0.98)",
         )
         fig_line.update_xaxes(tickformat="%Y-%m-%d")
-        st.plotly_chart(fig_line, use_container_width=True)
+        st.plotly_chart(fig_line, width="stretch")
 
     with tab_task:
         st.subheader("指定 Task 当天 vs 前几天对比")
@@ -627,12 +627,12 @@ def main() -> None:
                     plot_bgcolor="rgba(255,255,255,0.98)",
                 )
                 compare_fig.update_xaxes(tickformat="%Y-%m-%d")
-                st.plotly_chart(compare_fig, use_container_width=True)
+                st.plotly_chart(compare_fig, width="stretch")
                 st.dataframe(
                     task_daily.assign(run_day=lambda x: pd.to_datetime(x["run_day"], errors="coerce").dt.strftime("%Y-%m-%d"))
                     .rename(columns={"run_day": "日期", "duration_min": f"{metric_label}耗时(分钟)"})
                     .sort_values("日期", ascending=False),
-                    use_container_width=True,
+                    width="stretch",
                     height=240,
                 )
 
@@ -671,7 +671,7 @@ def main() -> None:
                 "domain": "业务域",
                 "criticality": "关键级别",
             },
-            use_container_width=True,
+            width="stretch",
             height=320,
         )
 
@@ -698,7 +698,7 @@ def main() -> None:
                 "domain": "业务域",
                 "criticality": "关键级别",
             },
-            use_container_width=True,
+            width="stretch",
             height=440,
         )
 
