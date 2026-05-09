@@ -1,17 +1,19 @@
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
-from pandas.errors import DatabaseError
-from sqlalchemy import create_engine
+
+from dashboard_shared import (
+    extract_base_url_from_curl,
+    extract_dag_allowlist_from_curl,
+    load_fact_data,
+)
 from update_cookie import parse_curl_auth
 
 
@@ -19,81 +21,14 @@ def _log(message: str) -> None:
     print(f"[app] {message}")
 
 
-def load_fact_data(db_url: str, fact_table: str) -> pd.DataFrame:
-    engine = create_engine(db_url)
-    try:
-        return pd.read_sql(f"SELECT * FROM {fact_table}", engine)
-    except DatabaseError:
-        _log(f"fact table={fact_table} not found yet")
-        return pd.DataFrame()
+def _series_utc(s: pd.Series) -> pd.Series:
+    """与 collector 一致：时间存 UTC；无时区信息按 UTC 解析。"""
+    return pd.to_datetime(s, errors="coerce", utc=True)
 
 
-def _extract_base_url_from_curl(curl_text: str) -> str:
-    text = (curl_text or "").strip()
-    if not text:
-        return ""
-    first_line = text.splitlines()[0]
-    quote_char = "'" if "'" in first_line else '"'
-    if "curl " not in first_line or quote_char not in first_line:
-        return ""
-    parts = first_line.split(quote_char)
-    if len(parts) < 2:
-        return ""
-    raw_url = parts[1].strip()
-    parsed = urlparse(raw_url)
-    if parsed.scheme and parsed.netloc:
-        return f"{parsed.scheme}://{parsed.netloc}"
-    return ""
-
-
-def _extract_dag_allowlist_from_curl(curl_text: str) -> str:
-    dag_ids: set[str] = set()
-    text = (curl_text or "").strip()
-    if not text:
-        return ""
-
-    # 1) Parse from request URL query string.
-    first_line = text.splitlines()[0]
-    quote_char = "'" if "'" in first_line else '"'
-    if "curl " in first_line and quote_char in first_line:
-        parts = first_line.split(quote_char)
-        if len(parts) >= 2:
-            raw_url = parts[1].strip()
-            parsed = urlparse(raw_url)
-            query = parse_qs(parsed.query)
-            for key in ("dag_id", "_flt_3_dag_id"):
-                for value in query.get(key, []):
-                    item = unquote(value).strip()
-                    if item:
-                        dag_ids.add(item)
-
-    # 2) Parse from --data-urlencode / --data params.
-    patterns = [
-        r"(?:--data-urlencode|--data)\s+'(?:_flt_3_dag_id|dag_id)=([^']+)'",
-        r"(?:--data-urlencode|--data)\s+\"(?:_flt_3_dag_id|dag_id)=([^\"]+)\"",
-        r"(?:\?|&)(?:_flt_3_dag_id|dag_id)=([^&'\"\\s]+)",
-    ]
-    for pattern in patterns:
-        for match in re.findall(pattern, text, flags=re.IGNORECASE):
-            item = unquote(str(match)).strip()
-            if item:
-                dag_ids.add(item)
-
-    # 3) Parse from --data-raw with repeated dag_ids params.
-    data_raw_patterns = [
-        r"--data-raw\s+'([^']*)'",
-        r"--data-raw\s+\"([^\"]*)\"",
-    ]
-    for raw_pattern in data_raw_patterns:
-        for raw_body in re.findall(raw_pattern, text, flags=re.IGNORECASE | re.DOTALL):
-            query = parse_qs(raw_body, keep_blank_values=False)
-            for key in ("dag_ids", "dag_id", "_flt_3_dag_id"):
-                for value in query.get(key, []):
-                    item = unquote(value).strip()
-                    if item:
-                        dag_ids.add(item)
-
-    return ",".join(sorted(dag_ids))
+def _series_beijing_strftime(s: pd.Series, fmt: str) -> pd.Series:
+    t = _series_utc(s)
+    return t.dt.tz_convert("Asia/Shanghai").dt.strftime(fmt)
 
 
 def main() -> None:
@@ -203,11 +138,11 @@ def main() -> None:
                         return
                     runtime_cookie = auth["cookie"]
                     runtime_csrf = auth.get("csrf", "")
-                    parsed_base_url = _extract_base_url_from_curl(curl_text)
+                    parsed_base_url = extract_base_url_from_curl(curl_text)
                     if parsed_base_url:
                         runtime_base_url = parsed_base_url
                         base_url_source = "cURL 自动解析"
-                    parsed_dag_allowlist = _extract_dag_allowlist_from_curl(curl_text)
+                    parsed_dag_allowlist = extract_dag_allowlist_from_curl(curl_text)
                     if parsed_dag_allowlist and not dag_allowlist_value.strip():
                         dag_allowlist_value = parsed_dag_allowlist
                         dag_allowlist_source = "cURL 自动解析"
@@ -283,19 +218,23 @@ def main() -> None:
 
     for col in ["execution_date", "start_date", "end_date"]:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+            df[col] = _series_utc(df[col])
 
     df["duration_min"] = pd.to_numeric(df["duration_sec"], errors="coerce").fillna(0) / 60.0
-    df["run_day"] = df["execution_date"].dt.date.astype("string")
+    df["run_day"] = _series_beijing_strftime(df["execution_date"], "%Y-%m-%d")
 
     st.sidebar.markdown("### 筛选与导航")
     st.sidebar.caption("先筛选范围，再看分标签洞察。")
     dag_options = sorted(df["dag_id"].dropna().unique().tolist())
     state_options = sorted(df["state"].dropna().unique().tolist())
     domain_options = sorted(df["domain"].dropna().unique().tolist())
-    all_days = pd.to_datetime(df["execution_date"], errors="coerce").dropna()
-    min_day = all_days.min().date()
-    max_day = all_days.max().date()
+    rd = df["run_day"].dropna()
+    if rd.empty:
+        sh_now = pd.Timestamp.now(tz="UTC").tz_convert("Asia/Shanghai").normalize()
+        min_day = max_day = sh_now.date()
+    else:
+        min_day = pd.to_datetime(rd.min(), errors="coerce").date()
+        max_day = pd.to_datetime(rd.max(), errors="coerce").date()
     default_start = max(min_day, max_day - pd.Timedelta(days=6))
     selected_days = st.sidebar.date_input(
         "时间范围",
@@ -330,10 +269,9 @@ def main() -> None:
     if start_day > end_day:
         start_day, end_day = end_day, start_day
 
-    filtered = df.copy()
-    filtered = filtered[
-        filtered["execution_date"].dt.date.between(start_day, end_day)
-    ]
+    filtered = df[
+        (df["run_day"] >= start_day.isoformat()) & (df["run_day"] <= end_day.isoformat())
+    ].copy()
     if dag_multi:
         filtered = filtered[filtered["dag_id"].isin(dag_multi)]
     if state_multi:
@@ -353,13 +291,7 @@ def main() -> None:
     filtered_display = filtered.copy()
     for col in ["execution_date", "start_date", "end_date"]:
         if col in filtered_display.columns:
-            filtered_display[col] = pd.to_datetime(filtered_display[col], errors="coerce").dt.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-    if "run_day" in filtered_display.columns:
-        filtered_display["run_day"] = pd.to_datetime(filtered_display["run_day"], errors="coerce").dt.strftime(
-            "%Y-%m-%d"
-        )
+            filtered_display[col] = _series_beijing_strftime(filtered_display[col], "%Y-%m-%d %H:%M:%S")
 
     st.markdown(
         f'<div class="section-note">当前筛选结果：{start_day} ~ {end_day}，任务实例 {len(filtered):,} 条。</div>',
@@ -386,10 +318,10 @@ def main() -> None:
         vol_lookback_days = vol_col1.slider("波动统计天数", min_value=3, max_value=30, value=14, step=1)
         vol_min_samples = vol_col2.slider("最少有效天数", min_value=2, max_value=10, value=3, step=1)
 
-        latest_day = filtered["execution_date"].dt.date.max()
+        latest_day = pd.to_datetime(filtered["run_day"].max(), errors="coerce").date()
         if pd.notna(latest_day):
             vol_start_day = latest_day - pd.Timedelta(days=vol_lookback_days - 1)
-            recent_df = filtered[filtered["execution_date"].dt.date >= vol_start_day].copy()
+            recent_df = filtered[filtered["run_day"] >= vol_start_day.isoformat()].copy()
         else:
             recent_df = filtered.copy()
 

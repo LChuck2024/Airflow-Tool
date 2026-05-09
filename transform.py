@@ -57,7 +57,11 @@ def build_fact(raw_df: pd.DataFrame, mapping_df: pd.DataFrame) -> pd.DataFrame:
     fact_df = raw_df.drop_duplicates(subset=["dag_id", "task_id", "run_id"], keep="last").copy()
 
     fact_df = fact_df.merge(mapping_df, on=["dag_id", "task_id"], how="left")
-    fact_df["run_date"] = fact_df["execution_date"].dt.date.astype("string")
+    fact_df["run_date"] = (
+        pd.to_datetime(fact_df["execution_date"], errors="coerce", utc=True)
+        .dt.tz_convert("Asia/Shanghai")
+        .dt.strftime("%Y-%m-%d")
+    )
 
     selected_cols = [
         "dag_id",

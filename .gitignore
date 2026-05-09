@@ -1,5 +1,6 @@
 .env
 .venv/
+.venv-backend/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -15,3 +16,10 @@ airflow_metrics.db
 
 # 导出数据（若有）
 data/*.csv
+
+# 前端构建与依赖（仓库只保留源码）
+frontend/node_modules/
+frontend/dist/
+
+# 根目录 npm（concurrently 等），勿提交
+node_modules/
