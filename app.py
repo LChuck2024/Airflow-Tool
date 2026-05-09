@@ -171,11 +171,8 @@ def main() -> None:
                 run_env["AIRFLOW_X_CSRFTOKEN"] = runtime_csrf
                 run_env["DAG_ALLOWLIST"] = dag_allowlist_value.strip()
                 dag_count = len([x for x in dag_allowlist_value.split(",") if x.strip()])
-                # Avoid UI appearing frozen when too many DAGs are selected.
-                if dag_count > 20:
-                    run_env["WEB_MAX_DAGRUNS_PER_DAG"] = "5"
-                else:
-                    run_env["WEB_MAX_DAGRUNS_PER_DAG"] = "15"
+                if not str(run_env.get("WEB_MAX_DAGRUNS_PER_DAG", "") or "").strip():
+                    run_env["WEB_MAX_DAGRUNS_PER_DAG"] = "5" if dag_count > 20 else "15"
                 st.info(
                     f"本次配置来源：BASE_URL={base_url_source}，DAG_ALLOWLIST={dag_allowlist_source}；"
                     f"DAG 数={dag_count}，WEB_MAX_DAGRUNS_PER_DAG={run_env['WEB_MAX_DAGRUNS_PER_DAG']}"
@@ -224,23 +221,26 @@ def main() -> None:
     df["run_day"] = _series_beijing_strftime(df["execution_date"], "%Y-%m-%d")
 
     st.sidebar.markdown("### 筛选与导航")
-    st.sidebar.caption("先筛选范围，再看分标签洞察。")
+    st.sidebar.caption("先筛选范围，再看分标签洞察。日期控件上限含上海「今日」，便于对齐采集区间；超出已有数据的日期可能无图表。")
     dag_options = sorted(df["dag_id"].dropna().unique().tolist())
     state_options = sorted(df["state"].dropna().unique().tolist())
     domain_options = sorted(df["domain"].dropna().unique().tolist())
     rd = df["run_day"].dropna()
+    sh_now = pd.Timestamp.now(tz="UTC").tz_convert("Asia/Shanghai").normalize()
+    sh_today = sh_now.date()
     if rd.empty:
-        sh_now = pd.Timestamp.now(tz="UTC").tz_convert("Asia/Shanghai").normalize()
-        min_day = max_day = sh_now.date()
+        min_day = max_day = sh_today
     else:
         min_day = pd.to_datetime(rd.min(), errors="coerce").date()
         max_day = pd.to_datetime(rd.max(), errors="coerce").date()
+    # 允许选到上海「今天」，便于对齐采集窗口；超出已有 run_day 的区间可能无数据
+    picker_max = max(max_day, sh_today)
     default_start = max(min_day, max_day - pd.Timedelta(days=6))
     selected_days = st.sidebar.date_input(
         "时间范围",
         value=(default_start, max_day),
         min_value=min_day,
-        max_value=max_day,
+        max_value=picker_max,
     )
     dag_multi = st.sidebar.multiselect("DAG（可多选）", dag_options, default=dag_options[: min(len(dag_options), 6)])
     state_multi = st.sidebar.multiselect("状态（可多选）", state_options, default=state_options)

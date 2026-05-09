@@ -116,10 +116,9 @@ def run_pipeline(body: PipelineRunBody):
     run_env["AIRFLOW_X_CSRFTOKEN"] = runtime_csrf
     run_env["DAG_ALLOWLIST"] = dag_allowlist_value
     dag_count = len([x for x in dag_allowlist_value.split(",") if x.strip()])
-    if dag_count > 20:
-        run_env["WEB_MAX_DAGRUNS_PER_DAG"] = "5"
-    else:
-        run_env["WEB_MAX_DAGRUNS_PER_DAG"] = "15"
+    # 尊重 .env / 进程环境变量中的 WEB_MAX；仅在未配置时使用保守默认值（此前会强行覆盖为 15，导致日更 DAG + 长回溯只见少量 Run）
+    if not str(run_env.get("WEB_MAX_DAGRUNS_PER_DAG", "") or "").strip():
+        run_env["WEB_MAX_DAGRUNS_PER_DAG"] = "5" if dag_count > 20 else "15"
 
     info_prefix = (
         f"BASE_URL={base_url_source}，DAG_ALLOWLIST={dag_allowlist_source}；"

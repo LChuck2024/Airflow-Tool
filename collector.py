@@ -5,6 +5,7 @@ import re
 import subprocess
 from io import StringIO
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List
 from urllib.parse import quote, urlparse
 
@@ -213,6 +214,122 @@ def _fetch_task_instances_from_web_list(
     return selected.reset_index(drop=True)
 
 
+_RUN_ID_ISO_CHUNK = re.compile(
+    r"(20\d{2}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+)
+
+
+def _pick_logical_date_column(columns: list[str]) -> str | None:
+    """
+    必须优先锁定「逻辑日期 / Logical Date」，避免「执行日期」等泛词匹配到错误列，
+    或小序号列被当成时间后解析出公元元年一类垃圾值。
+    """
+    pairs = [(c, c.strip().lower()) for c in columns]
+
+    def exact(*needles: str) -> str | None:
+        for want in needles:
+            w = want.lower()
+            for c, cl in pairs:
+                if cl == w:
+                    return c
+        return None
+
+    hit = exact("logical date", "逻辑日期", "logical_date")
+    if hit:
+        return hit
+
+    for needle in ("logical date", "逻辑日期", "logical"):
+        for c, cl in pairs:
+            if needle in cl and "duration" not in cl:
+                return c
+
+    for needle in ("execution date", "执行日期"):
+        for c, cl in pairs:
+            if needle in cl:
+                return c
+    return None
+
+
+def _sanitize_logical_timestamps(ts: pd.Series) -> pd.Series:
+    """剔除明显非法年份（常见于误列 / 序号被 read_html 当成日期）。"""
+    out = pd.to_datetime(ts, format="mixed", errors="coerce", utc=True)
+    year = out.dt.year
+    return out.where(year.between(1990, 2100, inclusive="both"))
+
+
+def _flatten_html_columns(columns: object) -> list[str]:
+    """pd.read_html 可能产出多级 columns；统一成单层可读字符串。"""
+    flat: list[str] = []
+    for c in list(columns):
+        if isinstance(c, tuple):
+            parts = [str(x).strip() for x in c if x is not None and str(x).strip().lower() not in {"", "nan"}]
+            flat.append(" ".join(parts).strip() or "_".join(str(x) for x in c))
+        else:
+            flat.append(str(c).strip())
+    return flat
+
+
+def _canonical_dagrun_list_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Airflow UI 语言不同时列表页表头不同（Logical Date / 逻辑日期 等）。
+    仅用英文字段 rename 会导致 execution_date 全空 → NaT → 全部被日期过滤。
+    """
+    out = df.copy()
+    out.columns = _flatten_html_columns(out.columns)
+
+    def pick_col(*candidates: str) -> str | None:
+        lower_cols = {c.lower(): c for c in out.columns}
+        for cand in candidates:
+            key = cand.lower()
+            if key in lower_cols:
+                return lower_cols[key]
+        # 列名包含关键词（适配「Logical Date (UTC)」等）
+        for col in out.columns:
+            cl = col.lower()
+            for cand in candidates:
+                if cand.lower() in cl:
+                    return col
+        return None
+
+    renames: Dict[str, str] = {}
+    dag_src = pick_col("dag id", "dag_id", "dagid")
+    if dag_src:
+        renames[dag_src] = "dag_id"
+    run_src = pick_col("run id", "run_id", "runid", "运行 id", "运行id")
+    if run_src:
+        renames[run_src] = "run_id"
+    logical_src = _pick_logical_date_column(list(out.columns))
+    if logical_src:
+        renames[logical_src] = "execution_date"
+    start_src = pick_col("start date", "start_date", "开始日期", "开始时间")
+    if start_src:
+        renames[start_src] = "start_date"
+    end_src = pick_col("end date", "end_date", "结束日期", "结束时间")
+    if end_src:
+        renames[end_src] = "end_date"
+    state_src = pick_col("state", "状态")
+    if state_src:
+        renames[state_src] = "state"
+
+    out = out.rename(columns=renames)
+    for col in ["dag_id", "run_id", "execution_date", "start_date", "end_date", "state"]:
+        if col not in out.columns:
+            out[col] = None
+    return out
+
+
+def _fill_execution_date_from_run_id(runs: pd.DataFrame) -> pd.DataFrame:
+    missing_exec = runs["execution_date"].isna()
+    if not missing_exec.any():
+        return runs
+    s = runs.loc[missing_exec, "run_id"].astype(str)
+    extracted = s.str.extract(_RUN_ID_ISO_CHUNK, expand=False)
+    parsed = pd.to_datetime(extracted, format="mixed", errors="coerce", utc=True)
+    runs = runs.copy()
+    runs.loc[missing_exec, "execution_date"] = _sanitize_logical_timestamps(parsed)
+    return runs
+
+
 def _fetch_dag_runs_from_web_list(
     base_url: str,
     headers: Dict[str, str],
@@ -250,29 +367,55 @@ def _fetch_dag_runs_from_web_list(
     if not tables:
         return pd.DataFrame()
     runs = tables[0].copy()
-    runs = runs.rename(
-        columns={
-            "Dag Id": "dag_id",
-            "Run Id": "run_id",
-            "Logical Date": "execution_date",
-            "Start Date": "start_date",
-            "End Date": "end_date",
-            "State": "state",
-        }
-    )
-    for col in ["dag_id", "run_id", "execution_date", "start_date", "end_date", "state"]:
-        if col not in runs.columns:
-            runs[col] = None
-    runs["execution_date"] = pd.to_datetime(runs["execution_date"], format="mixed", errors="coerce", utc=True)
+    runs = _canonical_dagrun_list_columns(runs)
+    runs["execution_date"] = _sanitize_logical_timestamps(runs["execution_date"])
+    runs = _fill_execution_date_from_run_id(runs)
     missing_exec = runs["execution_date"].isna()
     if missing_exec.any():
-        parsed_from_run_id = pd.to_datetime(
-            runs.loc[missing_exec, "run_id"].astype(str).str.extract(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[^+]+\+[0-9:]{2,5})")[0],
+        parsed_legacy = pd.to_datetime(
+            runs.loc[missing_exec, "run_id"].astype(str).str.extract(
+                r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[^+]+\+[0-9:]{2,5})",
+                expand=False,
+            ),
             errors="coerce",
             utc=True,
         )
-        runs.loc[missing_exec, "execution_date"] = parsed_from_run_id
+        runs.loc[missing_exec, "execution_date"] = _sanitize_logical_timestamps(parsed_legacy)
+    still_na = runs["execution_date"].isna()
+    if still_na.any():
+        fb = pd.to_datetime(runs.loc[still_na, "start_date"], format="mixed", errors="coerce", utc=True)
+        runs.loc[still_na, "execution_date"] = _sanitize_logical_timestamps(fb)
+
+    runs["execution_date"] = _sanitize_logical_timestamps(runs["execution_date"])
+
+    n_parse = len(runs)
+    valid_exec = int(runs["execution_date"].notna().sum())
+    cols_preview = list(runs.columns)[:14]
+    max_seen = runs["execution_date"].max() if valid_exec else pd.NaT
     runs = runs[runs["execution_date"] >= start_date]
+    n_keep = len(runs)
+    if n_parse == 0:
+        _log(f"web mode dag={dag_id}, dagrun list HTML produced no parseable rows")
+    elif n_keep == 0:
+        if valid_exec == 0:
+            _log(
+                f"web mode dag={dag_id}, parsed {n_parse} dagrun row(s) but logical date unparsed "
+                f"(locale/HTML columns?). columns≈{cols_preview}"
+            )
+        else:
+            suspicious = bool(pd.notna(max_seen) and int(max_seen.year) < 1990)
+            if suspicious:
+                _log(
+                    f"web mode dag={dag_id}, parsed {n_parse} dagrun row(s) but logical dates look invalid "
+                    f"(max_seen={max_seen}); likely wrong HTML column or locale. columns≈{cols_preview}"
+                )
+            else:
+                _log(
+                    f"web mode dag={dag_id}, parsed {n_parse} dagrun row(s), "
+                    f"max logical date seen={max_seen}, cutoff={start_date.isoformat()} (UTC); "
+                    f"all rows older than cutoff — increase COLLECT_DAYS"
+                )
+
     return runs[["dag_id", "run_id", "execution_date", "start_date", "end_date", "state"]].dropna(
         subset=["run_id", "execution_date"]
     )
@@ -569,6 +712,7 @@ def fetch_task_instances(days: int, page_limit: int) -> pd.DataFrame:
         if not dag_ids:
             raise ValueError("No DAG IDs found for AIRFLOW_SOURCE_MODE=web")
         _log(f"web mode dags={len(dag_ids)}")
+        _log(f"web mode collect window: logical date >= {start_date.isoformat()} (UTC), COLLECT_DAYS={days}")
         max_runs = int(os.getenv("WEB_MAX_DAGRUNS_PER_DAG", "30"))
         all_rows: List[dict] = []
         for dag_id in dag_ids:
@@ -585,7 +729,7 @@ def fetch_task_instances(days: int, page_limit: int) -> pd.DataFrame:
                 _log(f"web mode dag={dag_id}, skip due to error: {exc}")
                 continue
             if dag_runs.empty:
-                _log(f"web mode dag={dag_id}, no dag runs in date range")
+                _log(f"web mode dag={dag_id}, no dag runs after filters (see messages above)")
                 continue
             dag_runs = dag_runs.sort_values("execution_date", ascending=False).head(max_runs)
             _log(f"web mode dag={dag_id}, selected dag runs={len(dag_runs)}")
@@ -623,7 +767,8 @@ def save_raw(df: pd.DataFrame, db_url: str, raw_table: str, raw_csv_path: str) -
 
 
 def main() -> None:
-    load_dotenv()
+    root = Path(__file__).resolve().parent
+    load_dotenv(root / ".env", override=True)
     days = int(os.getenv("COLLECT_DAYS", "14"))
     page_limit = int(os.getenv("PAGE_LIMIT", "1000"))
     db_url = os.getenv("DB_URL", "sqlite:///airflow_metrics.db")

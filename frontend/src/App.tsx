@@ -39,6 +39,18 @@ function addDaysYmd(ymd: string, delta: number): string {
   return formatYmd(dt);
 }
 
+/** ISO 日期字符串比较（YYYY-MM-DD） */
+function maxYmd(a: string, b: string): string {
+  if (!a) return b;
+  if (!b) return a;
+  return a >= b ? a : b;
+}
+
+/** 当前 Asia/Shanghai 日历日 YYYY-MM-DD（与 fact 中 run_day 口径一致；须补零以适配 input[type=date]） */
+function todayYmdShanghai(): string {
+  return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
+}
+
 function quantileSorted(sortedAsc: number[], q: number): number {
   if (!sortedAsc.length) return 0;
   const clamped = Math.min(1, Math.max(0, q));
@@ -343,6 +355,13 @@ export default function App() {
     if (!days.length) return { min: "", max: "" };
     return { min: days[0], max: days[days.length - 1] };
   }, [rawRows]);
+
+  /** 日历控件可选范围：下限仍为数据集最小 run_day；上限至少到上海「今天」，避免数据滞后时无法选今日 */
+  const datePickerBounds = useMemo(() => {
+    if (!dayBounds.min || !dayBounds.max) return { min: "", max: "" };
+    const today = todayYmdShanghai();
+    return { min: dayBounds.min, max: maxYmd(dayBounds.max, today) };
+  }, [dayBounds]);
 
   useEffect(() => {
     if (!dayBounds.min || !dayBounds.max) return;
@@ -701,8 +720,15 @@ export default function App() {
       x: daily.map((d) => d.run_day),
       y: daily.map((d) => d.primary),
       name: `${metricLabel}(柱状)`,
+      marker: {
+        color: isDark ? "rgba(56, 189, 248, 0.42)" : "rgba(37, 99, 235, 0.55)",
+        line: { color: isDark ? "rgba(125, 211, 252, 0.85)" : "#1d4ed8", width: 1 },
+      },
     };
     const trendDaily = [...daily].sort((a, b) => a.run_day.localeCompare(b.run_day));
+    const lineW = isDark ? 2.75 : 2.25;
+    const mk = isDark ? 9 : 7;
+    /* 单 Y 轴：柱与折线单位同为「分钟」，原先 y/y2 各自 autorange 会导致像素错位，图例上的折线像「消失」 */
     const traces: Data[] = [
       barTrace,
       {
@@ -711,8 +737,8 @@ export default function App() {
         x: trendDaily.map((d) => d.run_day),
         y: trendDaily.map((d) => d.mean),
         name: "均值",
-        yaxis: "y2",
-        line: { color: "#1f77b4" },
+        line: { color: isDark ? "#e2e8f0" : "#475569", width: lineW, shape: "spline", smoothing: 0.35 },
+        marker: { size: mk, color: isDark ? "#f1f5f9" : "#475569", line: { width: 0 } },
       },
       {
         type: "scatter",
@@ -720,8 +746,8 @@ export default function App() {
         x: trendDaily.map((d) => d.run_day),
         y: trendDaily.map((d) => d.p95),
         name: "95% 分位",
-        yaxis: "y2",
-        line: { color: "#ff7f0e" },
+        line: { color: isDark ? "#fbbf24" : "#b45309", width: lineW, shape: "spline", smoothing: 0.35 },
+        marker: { size: mk, color: isDark ? "#fcd34d" : "#b45309", line: { width: 0 } },
       },
       {
         type: "scatter",
@@ -729,23 +755,31 @@ export default function App() {
         x: trendDaily.map((d) => d.run_day),
         y: trendDaily.map((d) => d.max),
         name: "最大值",
-        yaxis: "y2",
-        line: { color: "#d62728" },
+        line: { color: isDark ? "#fb7185" : "#dc2626", width: lineW, shape: "spline", smoothing: 0.35 },
+        marker: { size: mk, color: isDark ? "#fda4af" : "#dc2626", line: { width: 0 } },
       },
     ];
+    const fg = isDark ? "#e8ebf4" : "#0c1222";
     const layout: Partial<Layout> = {
-      ...chartLayoutBase(isDark, { t: 20, r: 56, b: 64, l: 56 }),
+      ...chartLayoutBase(isDark, { t: 24, r: 28, b: 92, l: 56 }),
       title: `${task_id} 每日${metricLabel}耗时对比(分钟)`,
       xaxis: { ...chartAxisGrid(isDark), title: "运行日期", tickformat: "%Y-%m-%d" },
-      yaxis: { ...chartAxisGrid(isDark), title: `${metricLabel}(柱状)` },
-      yaxis2: {
+      yaxis: {
         ...chartAxisGrid(isDark),
-        title: "均值 · 95% 分位 · 最大值（折线）",
-        overlaying: "y",
-        side: "right",
-        showgrid: false,
+        title: `${metricLabel}(柱) · 均值 / P95 / 最大值（线）`,
+        rangemode: "tozero",
       },
-      legend: { orientation: "h" },
+      legend: {
+        orientation: "h",
+        yanchor: "top",
+        y: -0.2,
+        xanchor: "center",
+        x: 0.5,
+        font: { size: 12, color: fg },
+        bgcolor: isDark ? "rgba(15, 23, 42, 0.82)" : "rgba(255,255,255,0.92)",
+        bordercolor: isDark ? "rgba(148,163,184,0.35)" : "rgba(15,23,42,0.08)",
+        borderwidth: 1,
+      },
       shapes:
         baseline > 0
           ? [
@@ -757,7 +791,11 @@ export default function App() {
                 x1: 1,
                 y0: baseline,
                 y1: baseline,
-                line: { dash: "dash", color: isDark ? "#f87171" : "#dc2626" },
+                line: {
+                  dash: "dash",
+                  width: 2,
+                  color: isDark ? "rgba(251, 191, 36, 0.85)" : "#ca8a04",
+                },
               },
             ]
           : [],
@@ -910,8 +948,8 @@ export default function App() {
             <input
               type="date"
               value={startDay}
-              min={dayBounds.min}
-              max={dayBounds.max}
+              min={datePickerBounds.min}
+              max={datePickerBounds.max}
               onChange={(e) => setStartDay(e.target.value)}
             />
             <label className="form-label form-label--inline">
@@ -921,10 +959,13 @@ export default function App() {
             <input
               type="date"
               value={endDay}
-              min={dayBounds.min}
-              max={dayBounds.max}
+              min={datePickerBounds.min}
+              max={datePickerBounds.max}
               onChange={(e) => setEndDay(e.target.value)}
             />
+            <p className="card__hint" style={{ margin: "0.35rem 0 0", fontSize: "0.72rem" }}>
+              数据当前覆盖至 <strong>{dayBounds.max || "—"}</strong>；日历可选至「今日」以便对齐采集区间（区间内若无跑批则图表为空）。
+            </p>
             <div className="sidebar__divider" />
             <label className="form-label form-label--inline">
               <IconLayers />
@@ -1418,7 +1459,7 @@ export default function App() {
                     watermarkIcon={<IconAlertTriangle />}
                   />
                 </div>
-                <div className="table-wrap">
+                <div className="table-wrap table-wrap--viewport">
                   <table>
                     <thead>
                       <tr>
@@ -1472,7 +1513,7 @@ export default function App() {
                 >
                   下载筛选结果 CSV
                 </button>
-                <div className="table-wrap" style={{ maxHeight: 480 }}>
+                <div className="table-wrap table-wrap--viewport">
                   <table>
                     <thead>
                       <tr>

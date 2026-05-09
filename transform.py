@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import List
 
 import pandas as pd
@@ -82,7 +83,8 @@ def build_fact(raw_df: pd.DataFrame, mapping_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
-    load_dotenv()
+    root = Path(__file__).resolve().parent
+    load_dotenv(root / ".env", override=True)
     db_url = os.getenv("DB_URL", "sqlite:///airflow_metrics.db")
     raw_table = os.getenv("RAW_TABLE", "raw_task_instances")
     fact_table = os.getenv("FACT_TABLE", "fact_airflow_task_run")

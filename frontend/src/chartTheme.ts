@@ -32,9 +32,9 @@ export function plotHeightHorizontalBars(barCount: number): number {
 
 export function chartAxisGrid(dark: boolean): { gridcolor: string; zerolinecolor: string; color?: string } {
   return {
-    gridcolor: dark ? "rgba(255,255,255,0.07)" : "rgba(12, 18, 34, 0.08)",
-    zerolinecolor: dark ? "rgba(255,255,255,0.12)" : "rgba(12, 18, 34, 0.12)",
-    color: dark ? "#a8b0c4" : "#5c6578",
+    gridcolor: dark ? "rgba(255,255,255,0.11)" : "rgba(12, 18, 34, 0.09)",
+    zerolinecolor: dark ? "rgba(255,255,255,0.16)" : "rgba(12, 18, 34, 0.12)",
+    color: dark ? "#c7d0e4" : "#5c6578",
   };
 }
 
