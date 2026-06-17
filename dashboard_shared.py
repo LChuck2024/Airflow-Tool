@@ -24,6 +24,32 @@ def load_fact_data(db_url: str, fact_table: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def load_dag_edges(db_url: str, edges_table: str, edges_csv_path: str) -> pd.DataFrame:
+    engine = create_engine(db_url)
+    try:
+        df = pd.read_sql(f"SELECT * FROM {edges_table}", engine)
+        if not df.empty:
+            return df
+    except DatabaseError:
+        _log(f"edges table={edges_table} not found yet")
+
+    csv_path = Path(edges_csv_path)
+    if csv_path.is_file():
+        try:
+            return pd.read_csv(csv_path)
+        except Exception as exc:
+            _log(f"read edges csv failed: {exc}")
+    return pd.DataFrame(columns=["dag_id", "task_id", "upstream_task_id"])
+
+
+def default_edges_table() -> str:
+    return os.getenv("EDGES_TABLE", "dag_task_edges")
+
+
+def default_edges_csv_path() -> str:
+    return os.getenv("EDGES_CSV_PATH", "data/dag_task_edges.csv")
+
+
 def extract_base_url_from_curl(curl_text: str) -> str:
     text = (curl_text or "").strip()
     if not text:

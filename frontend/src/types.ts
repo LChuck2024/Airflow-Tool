@@ -28,3 +28,14 @@ export interface PipelineResponse {
   stdout: string;
   message: string;
 }
+
+export interface DagEdge {
+  dag_id: string;
+  task_id: string;
+  upstream_task_id: string;
+}
+
+export interface DagEdgesResponse {
+  edges: DagEdge[];
+  count: number;
+}

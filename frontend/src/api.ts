@@ -1,4 +1,4 @@
-import type { FactResponse, PipelineResponse } from "./types";
+import type { DagEdgesResponse, FactResponse, PipelineResponse } from "./types";
 
 function apiPrefix(): string {
   const raw = import.meta.env.VITE_API_BASE_URL ?? "";
@@ -53,6 +53,10 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function fetchFact(): Promise<FactResponse> {
   return fetchJson<FactResponse>("/api/fact");
+}
+
+export function fetchDagEdges(): Promise<DagEdgesResponse> {
+  return fetchJson<DagEdgesResponse>("/api/dag-edges");
 }
 
 export function runPipeline(body: { curl_text: string; dag_allowlist: string }): Promise<PipelineResponse> {

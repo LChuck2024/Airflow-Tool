@@ -679,6 +679,107 @@ def _fetch_task_instances_by_dag(
     return all_rows
 
 
+def _fetch_dag_task_edges_for_dag(
+    session: requests.Session,
+    base_url: str,
+    dag_id: str,
+    headers: Dict[str, str],
+    auth,
+    verify_setting,
+    use_curl_fallback: bool,
+    page_limit: int,
+) -> List[dict]:
+    rows: List[dict] = []
+    dag_id_encoded = quote(dag_id, safe="")
+    offset = 0
+    while True:
+        body = _airflow_request_json(
+            session=session,
+            method="GET",
+            url=f"{base_url}/api/v1/dags/{dag_id_encoded}/tasks",
+            query={"limit": page_limit, "offset": offset},
+            headers=headers,
+            auth=auth,
+            verify_setting=verify_setting,
+            use_curl_fallback=use_curl_fallback,
+        )
+        _ensure_not_api_error(body, f"GET /api/v1/dags/{dag_id}/tasks")
+        tasks = body.get("tasks", [])
+        for task in tasks:
+            task_id = task.get("task_id")
+            if not task_id:
+                continue
+            upstream_ids = task.get("upstream_task_ids") or []
+            if not upstream_ids:
+                rows.append({"dag_id": dag_id, "task_id": task_id, "upstream_task_id": ""})
+                continue
+            for upstream_task_id in upstream_ids:
+                if upstream_task_id:
+                    rows.append(
+                        {
+                            "dag_id": dag_id,
+                            "task_id": task_id,
+                            "upstream_task_id": upstream_task_id,
+                        }
+                    )
+        if len(tasks) < page_limit:
+            break
+        offset += page_limit
+    return rows
+
+
+def fetch_dag_task_edges(page_limit: int) -> pd.DataFrame:
+    base_url = _resolve_base_url()
+    verify_setting = _resolve_verify_setting()
+    session = requests.Session()
+    session.mount("https://", TLSv12HttpAdapter())
+    headers = {"Content-Type": "application/json"}
+    headers.update(_build_auth_headers())
+    auth = None
+    use_curl_fallback = _to_bool(os.getenv("AIRFLOW_USE_CURL_FALLBACK", "true"), default=True)
+
+    dag_ids = _load_dag_ids(
+        session=session,
+        base_url=base_url,
+        headers=headers,
+        auth=auth,
+        verify_setting=verify_setting,
+        use_curl_fallback=use_curl_fallback,
+        page_limit=page_limit,
+    )
+    all_rows: List[dict] = []
+    for dag_id in dag_ids:
+        try:
+            rows = _fetch_dag_task_edges_for_dag(
+                session=session,
+                base_url=base_url,
+                dag_id=dag_id,
+                headers=headers,
+                auth=auth,
+                verify_setting=verify_setting,
+                use_curl_fallback=use_curl_fallback,
+                page_limit=page_limit,
+            )
+            all_rows.extend(rows)
+            _log(f"dag={dag_id}, task edges={len(rows)}")
+        except Exception as exc:
+            _log(f"dag={dag_id}, skip task edges due to error: {exc}")
+            continue
+    return pd.DataFrame(all_rows)
+
+
+def save_dag_edges(df: pd.DataFrame, db_url: str, edges_table: str, edges_csv_path: str) -> None:
+    os.makedirs(os.path.dirname(edges_csv_path), exist_ok=True)
+    engine = create_engine(db_url)
+    if df.empty:
+        _log("no dag edges fetched, skip writing edges table")
+        return
+    df.to_sql(edges_table, engine, if_exists="replace", index=False)
+    df.to_csv(edges_csv_path, index=False, encoding="utf-8")
+    _log(f"saved edges table={edges_table}, rows={len(df)}")
+    _log(f"saved edges csv={edges_csv_path}")
+
+
 def fetch_task_instances(days: int, page_limit: int) -> pd.DataFrame:
     base_url = _resolve_base_url()
     verify_setting = _resolve_verify_setting()
@@ -774,12 +875,17 @@ def main() -> None:
     db_url = os.getenv("DB_URL", "sqlite:///airflow_metrics.db")
     raw_table = os.getenv("RAW_TABLE", "raw_task_instances")
     raw_csv_path = os.getenv("RAW_CSV_PATH", "data/raw_task_instances.csv")
+    edges_table = os.getenv("EDGES_TABLE", "dag_task_edges")
+    edges_csv_path = os.getenv("EDGES_CSV_PATH", "data/dag_task_edges.csv")
 
     try:
         _log("start extract from airflow api")
         raw_df = fetch_task_instances(days=days, page_limit=page_limit)
         _log(f"extract done, total rows={len(raw_df)}")
         save_raw(raw_df, db_url=db_url, raw_table=raw_table, raw_csv_path=raw_csv_path)
+        edges_df = fetch_dag_task_edges(page_limit=page_limit)
+        _log(f"task edges extract done, total rows={len(edges_df)}")
+        save_dag_edges(edges_df, db_url=db_url, edges_table=edges_table, edges_csv_path=edges_csv_path)
     except requests.exceptions.SSLError as exc:
         _log(
             "ssl handshake failed. Try setting AIRFLOW_CA_BUNDLE to the server CA file, "

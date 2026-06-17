@@ -18,9 +18,12 @@ if str(ROOT) not in sys.path:
 
 from dashboard_shared import (  # noqa: E402
     default_db_url,
+    default_edges_csv_path,
+    default_edges_table,
     default_fact_table,
     extract_base_url_from_curl,
     extract_dag_allowlist_from_curl,
+    load_dag_edges,
     load_fact_data,
     project_root,
 )
@@ -75,6 +78,26 @@ def get_fact():
 
     records = json.loads(df.to_json(orient="records", date_format="iso"))
     return {"rows": records, "columns": list(df.columns), "count": len(records)}
+
+
+@app.get("/api/dag-edges")
+def get_dag_edges():
+    db_url = default_db_url()
+    edges_table = default_edges_table()
+    edges_csv = str(project_root() / default_edges_csv_path())
+    try:
+        df = load_dag_edges(db_url=db_url, edges_table=edges_table, edges_csv_path=edges_csv)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if df.empty:
+        return {"edges": [], "count": 0}
+
+    for col in ["dag_id", "task_id", "upstream_task_id"]:
+        if col not in df.columns:
+            df[col] = None
+    records = json.loads(df[["dag_id", "task_id", "upstream_task_id"]].to_json(orient="records"))
+    return {"edges": records, "count": len(records)}
 
 
 @app.post("/api/pipeline/run", response_model=PipelineRunResponse)

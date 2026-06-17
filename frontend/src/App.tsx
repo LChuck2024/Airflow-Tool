@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
 import Plot from "react-plotly.js";
 import type { Data, Layout } from "plotly.js";
-import { fetchFact, runPipeline } from "./api";
+import { fetchDagEdges, fetchFact, runPipeline } from "./api";
+import {
+  attributeSlowdownRoots,
+  summarizeSlowdownRoots,
+  type DagEdge,
+} from "./dagGraph";
 import {
   chartAxisGrid,
   chartLayoutBase,
@@ -82,6 +87,76 @@ function groupMeanByKey(rows: FactRow[], keyFn: (r: FactRow) => string): Map<str
     m.get(k)!.push(r.duration_min);
   }
   return m;
+}
+
+function applySidebarFilters(
+  rows: FactRow[],
+  dagMulti: string[],
+  stateMulti: string[],
+  domainMulti: string[],
+  taskKeyword: string,
+): FactRow[] {
+  let out = rows;
+  if (dagMulti.length) out = out.filter((r) => r.dag_id && dagMulti.includes(r.dag_id));
+  if (stateMulti.length) out = out.filter((r) => r.state && stateMulti.includes(r.state));
+  if (domainMulti.length) out = out.filter((r) => r.domain && domainMulti.includes(r.domain));
+  const kw = taskKeyword.trim().toLowerCase();
+  if (kw) out = out.filter((r) => (r.task_id || "").toLowerCase().includes(kw));
+  return out;
+}
+
+function parseIsoMs(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? null : t;
+}
+
+/** DAG 墙钟耗时：末 task 结束 − 首 task 开始；缺起止时间则回退为各 Task 均值之和 */
+function dagWallClockMin(rows: FactRow[]): { minutes: number; source: "起止时间" | "任务合计" } | null {
+  if (!rows.length) return null;
+  let minStart = Infinity;
+  let maxEnd = -Infinity;
+  for (const r of rows) {
+    const s = parseIsoMs(r.start_date);
+    const e = parseIsoMs(r.end_date);
+    if (s != null) minStart = Math.min(minStart, s);
+    if (e != null) maxEnd = Math.max(maxEnd, e);
+  }
+  if (Number.isFinite(minStart) && Number.isFinite(maxEnd) && maxEnd >= minStart) {
+    return { minutes: (maxEnd - minStart) / 60000, source: "起止时间" };
+  }
+  const byTask = groupMeanByKey(
+    rows.filter((r) => r.dag_id && r.task_id),
+    (r) => `${r.dag_id}|||${r.task_id}`,
+  );
+  if (!byTask.size) return null;
+  let sum = 0;
+  for (const [, vals] of byTask) {
+    sum += vals.reduce((a, b) => a + b, 0) / vals.length;
+  }
+  return { minutes: sum, source: "任务合计" };
+}
+
+function taskMeanMap(rows: FactRow[]): Map<string, { dag_id: string; task_id: string; mean_min: number; max_min: number }> {
+  const g = groupMeanByKey(rows, (r) => (r.dag_id && r.task_id ? `${r.dag_id}|||${r.task_id}` : ""));
+  const out = new Map<string, { dag_id: string; task_id: string; mean_min: number; max_min: number }>();
+  for (const [k, vals] of g) {
+    const [dag_id, task_id] = k.split("|||");
+    out.set(k, {
+      dag_id,
+      task_id,
+      mean_min: vals.reduce((a, b) => a + b, 0) / vals.length,
+      max_min: Math.max(...vals),
+    });
+  }
+  return out;
+}
+
+function slowdownLabel(deltaMin: number, ratio: number): "显著变慢" | "轻微变慢" | "变快" | "持平" {
+  if (deltaMin > 5 && ratio >= 1.25) return "显著变慢";
+  if (deltaMin > 0.5) return "轻微变慢";
+  if (deltaMin < -0.5) return "变快";
+  return "持平";
 }
 
 function riskFromCv(cv: number): "高风险" | "中风险" | "低风险" {
@@ -232,6 +307,130 @@ function ThemeToggleGlyph({ dark }: { dark: boolean }) {
   );
 }
 
+function TaskSearchSelect({
+  options,
+  value,
+  onChange,
+}: {
+  options: string[];
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return options;
+    return options.filter((o) => o.toLowerCase().includes(q));
+  }, [options, query]);
+
+  useEffect(() => {
+    const onDocPointer = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        setQuery("");
+      }
+    };
+    document.addEventListener("mousedown", onDocPointer);
+    return () => document.removeEventListener("mousedown", onDocPointer);
+  }, []);
+
+  const pick = (opt: string) => {
+    onChange(opt);
+    setOpen(false);
+    setQuery("");
+  };
+
+  return (
+    <div className="task-search" ref={wrapRef} style={{ marginBottom: "0.75rem" }}>
+      <input
+        type="text"
+        className="input-text"
+        role="combobox"
+        aria-expanded={open}
+        aria-autocomplete="list"
+        value={open ? query : value}
+        placeholder="输入 DAG / Task 关键词搜索匹配"
+        onFocus={() => {
+          setOpen(true);
+          setQuery(value);
+        }}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setOpen(true);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            if (filtered[0]) pick(filtered[0]);
+          } else if (e.key === "Escape") {
+            setOpen(false);
+            setQuery("");
+          }
+        }}
+      />
+      {open ? (
+        filtered.length ? (
+          <ul className="task-search__list" role="listbox">
+            {filtered.slice(0, 80).map((opt) => (
+              <li
+                key={opt}
+                role="option"
+                aria-selected={opt === value}
+                className={opt === value ? "task-search__item task-search__item--active" : "task-search__item"}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => pick(opt)}
+              >
+                {opt}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="task-search__empty">无匹配 Task，请调整关键词</p>
+        )
+      ) : null}
+      <p className="task-search__hint">
+        共 {options.length} 个 Task
+        {query.trim() ? `，匹配 ${filtered.length} 个` : ""}
+      </p>
+    </div>
+  );
+}
+
+function CopyPlainBlock({
+  label,
+  text,
+  toastMsg,
+  onCopy,
+}: {
+  label: string;
+  text: string;
+  toastMsg: string;
+  onCopy: (plain: string, okMsg: string) => void;
+}) {
+  if (!text.trim()) return null;
+  const lineCount = text.split("\n").length;
+  return (
+    <div className="chart-shell__copyblock">
+      <div className="chart-shell__copyhead">
+        <span className="chart-shell__copylabel">{label}</span>
+        <button type="button" className="btn-ghost btn-ghost--sm chart-shell__copybtn" onClick={() => onCopy(text, toastMsg)}>
+          复制全部
+        </button>
+      </div>
+      <p className="chart-shell__copyhint">每行一条记录；名称过长时可横向滚动，避免换行错位。</p>
+      <div
+        className="chart-shell__copyscroll"
+        style={{ maxHeight: Math.min(320, Math.max(120, lineCount * 20 + 28)) }}
+      >
+        <pre className="chart-shell__copypre">{text}</pre>
+      </div>
+    </div>
+  );
+}
+
 function StatCard({
   label,
   value,
@@ -285,6 +484,7 @@ export default function App() {
   const [theme, setTheme] = useState<UiTheme>(() => readStoredTheme());
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
   const [copyToast, setCopyToast] = useState<string | null>(null);
+  const [dagEdges, setDagEdges] = useState<DagEdge[]>([]);
 
   const initFilters = useRef(false);
 
@@ -323,11 +523,20 @@ export default function App() {
     setLoading(true);
     setLoadError(null);
     try {
-      const res = await fetchFact();
+      const [res, edgesRes] = await Promise.all([
+        fetchFact(),
+        fetchDagEdges().catch(() => ({ edges: [] as DagEdge[], count: 0 })),
+      ]);
       setRawRows(normalizeRows(res.rows));
+      setDagEdges(
+        edgesRes.edges.filter(
+          (e) => e.dag_id && e.task_id && e.upstream_task_id,
+        ) as DagEdge[],
+      );
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
       setRawRows([]);
+      setDagEdges([]);
     } finally {
       setLoading(false);
     }
@@ -386,14 +595,15 @@ export default function App() {
     const sd = startDay || dayBounds.min;
     const ed = endDay || dayBounds.max;
     if (!sd || !ed) return [];
-    let out = rawRows.filter((r) => r.run_day && dateInRange(r.run_day, sd, ed));
-    if (dagMulti.length) out = out.filter((r) => r.dag_id && dagMulti.includes(r.dag_id));
-    if (stateMulti.length) out = out.filter((r) => r.state && stateMulti.includes(r.state));
-    if (domainMulti.length) out = out.filter((r) => r.domain && domainMulti.includes(r.domain));
-    const kw = taskKeyword.trim().toLowerCase();
-    if (kw) out = out.filter((r) => (r.task_id || "").toLowerCase().includes(kw));
-    return out;
+    return applySidebarFilters(rawRows, dagMulti, stateMulti, domainMulti, taskKeyword).filter(
+      (r) => r.run_day && dateInRange(r.run_day, sd, ed),
+    );
   }, [rawRows, startDay, endDay, dayBounds, dagMulti, stateMulti, domainMulti, taskKeyword]);
+
+  const sidebarFilteredAll = useMemo(
+    () => applySidebarFilters(rawRows, dagMulti, stateMulti, domainMulti, taskKeyword),
+    [rawRows, dagMulti, stateMulti, domainMulti, taskKeyword],
+  );
 
   const filteredDisplay = useMemo(() => {
     return filtered.map((r) => ({
@@ -403,6 +613,190 @@ export default function App() {
       end_date: formatIsoToBeijing(r.end_date ?? null) || (r.end_date ?? ""),
     }));
   }, [filtered]);
+
+  /** 总览参考日：优先筛选结束日，否则取区间内最新 run_day */
+  const focusDay = useMemo(() => {
+    if (!filtered.length) return "";
+    const ed = endDay || dayBounds.max;
+    if (ed && filtered.some((r) => r.run_day === ed)) return ed;
+    const days = filtered.map((r) => r.run_day).filter(Boolean).sort();
+    return days[days.length - 1] || "";
+  }, [filtered, endDay, dayBounds.max]);
+
+  /** 对比基线日：默认昨日；若无数据则取参考日前一个有效 run_day */
+  const baselineDay = useMemo(() => {
+    if (!focusDay) return "";
+    const days = [...new Set(sidebarFilteredAll.map((r) => r.run_day).filter(Boolean))].sort();
+    const yesterday = addDaysYmd(focusDay, -1);
+    if (days.includes(yesterday)) return yesterday;
+    const idx = days.indexOf(focusDay);
+    if (idx > 0) return days[idx - 1];
+    return "";
+  }, [focusDay, sidebarFilteredAll]);
+
+  const focusDayRows = useMemo(
+    () => sidebarFilteredAll.filter((r) => r.run_day === focusDay),
+    [sidebarFilteredAll, focusDay],
+  );
+  const baselineDayRows = useMemo(
+    () => sidebarFilteredAll.filter((r) => r.run_day === baselineDay),
+    [sidebarFilteredAll, baselineDay],
+  );
+
+  const dagCompareRows = useMemo(() => {
+    if (!focusDay || !baselineDay) return [];
+    const dags = uniqSorted(
+      [...focusDayRows, ...baselineDayRows].map((r) => r.dag_id).filter((x): x is string => !!x),
+    );
+    const rows: {
+      dag_id: string;
+      today_min: number;
+      baseline_min: number;
+      delta_min: number;
+      delta_pct: number;
+      ratio: number;
+      span_source: "起止时间" | "任务合计";
+    }[] = [];
+    for (const dag_id of dags) {
+      const todayMetric = dagWallClockMin(focusDayRows.filter((r) => r.dag_id === dag_id));
+      const baselineMetric = dagWallClockMin(baselineDayRows.filter((r) => r.dag_id === dag_id));
+      if (!todayMetric || !baselineMetric) continue;
+      const delta_min = todayMetric.minutes - baselineMetric.minutes;
+      const delta_pct = baselineMetric.minutes > 0 ? (delta_min / baselineMetric.minutes) * 100 : 0;
+      const ratio = baselineMetric.minutes > 0 ? todayMetric.minutes / baselineMetric.minutes : 0;
+      rows.push({
+        dag_id,
+        today_min: todayMetric.minutes,
+        baseline_min: baselineMetric.minutes,
+        delta_min,
+        delta_pct,
+        ratio,
+        span_source: todayMetric.source === "起止时间" && baselineMetric.source === "起止时间" ? "起止时间" : "任务合计",
+      });
+    }
+    return rows.sort((a, b) => b.delta_min - a.delta_min || b.today_min - a.today_min);
+  }, [focusDay, baselineDay, focusDayRows, baselineDayRows]);
+
+  const taskDeltaRows = useMemo(() => {
+    if (!focusDay || !baselineDay) return [];
+    const todayMap = taskMeanMap(focusDayRows);
+    const baselineMap = taskMeanMap(baselineDayRows);
+    const keys = new Set([...todayMap.keys(), ...baselineMap.keys()]);
+    const rows: {
+      dag_id: string;
+      task_id: string;
+      dag_task: string;
+      today_min: number;
+      baseline_min: number;
+      delta_min: number;
+      delta_pct: number;
+      ratio: number;
+      both_days: boolean;
+      slowdown: "显著变慢" | "轻微变慢" | "变快" | "持平" | "仅今日" | "仅基线日";
+    }[] = [];
+    for (const k of keys) {
+      const t = todayMap.get(k);
+      const b = baselineMap.get(k);
+      const dag_id = t?.dag_id || b?.dag_id || "";
+      const task_id = t?.task_id || b?.task_id || "";
+      if (!dag_id || !task_id) continue;
+      if (t && b) {
+        const delta_min = t.mean_min - b.mean_min;
+        const delta_pct = b.mean_min > 0 ? (delta_min / b.mean_min) * 100 : 0;
+        const ratio = b.mean_min > 0 ? t.mean_min / b.mean_min : 0;
+        rows.push({
+          dag_id,
+          task_id,
+          dag_task: `${dag_id} / ${task_id}`,
+          today_min: t.mean_min,
+          baseline_min: b.mean_min,
+          delta_min,
+          delta_pct,
+          ratio,
+          both_days: true,
+          slowdown: slowdownLabel(delta_min, ratio),
+        });
+      } else if (t) {
+        rows.push({
+          dag_id,
+          task_id,
+          dag_task: `${dag_id} / ${task_id}`,
+          today_min: t.mean_min,
+          baseline_min: 0,
+          delta_min: t.mean_min,
+          delta_pct: 0,
+          ratio: 0,
+          both_days: false,
+          slowdown: "仅今日",
+        });
+      } else if (b) {
+        rows.push({
+          dag_id,
+          task_id,
+          dag_task: `${dag_id} / ${task_id}`,
+          today_min: 0,
+          baseline_min: b.mean_min,
+          delta_min: -b.mean_min,
+          delta_pct: -100,
+          ratio: 0,
+          both_days: false,
+          slowdown: "仅基线日",
+        });
+      }
+    }
+    return rows
+      .filter((r) => r.both_days)
+      .sort((a, b) => b.delta_min - a.delta_min || b.today_min - a.today_min)
+      .slice(0, topN);
+  }, [focusDay, baselineDay, focusDayRows, baselineDayRows, topN]);
+
+  const taskDeltaAttributed = useMemo(
+    () => attributeSlowdownRoots(taskDeltaRows, dagEdges, focusDayRows),
+    [taskDeltaRows, dagEdges, focusDayRows],
+  );
+
+  const slowdownRootSummary = useMemo(
+    () => summarizeSlowdownRoots(taskDeltaAttributed),
+    [taskDeltaAttributed],
+  );
+
+  const depSourceHint = useMemo(() => {
+    if (dagEdges.length) return "Airflow DAG 依赖（ETL 采集）";
+    const src = taskDeltaAttributed[0]?.dep_source;
+    if (src === "timing") return "当日运行起止时间推断（请重跑 ETL 可采集正式依赖）";
+    return "混合依赖";
+  }, [dagEdges.length, taskDeltaAttributed]);
+
+  const dayRankData = useMemo(() => {
+    if (!focusDay) return [];
+    const dayRows = filtered.filter((r) => r.run_day === focusDay && r.dag_id && r.task_id);
+    const g = groupMeanByKey(dayRows, (r) => `${r.dag_id}|||${r.task_id}`);
+    const rows = [...g.entries()]
+      .map(([k, vals]) => {
+        const duration_min = Math.max(...vals);
+        const mean_min = vals.reduce((a, b) => a + b, 0) / vals.length;
+        const [dag_id, task_id] = k.split("|||");
+        return {
+          dag_id,
+          task_id,
+          duration_min,
+          mean_min,
+          instances: vals.length,
+          dag_task: `${dag_id} / ${task_id}`,
+        };
+      })
+      .sort((a, b) => b.duration_min - a.duration_min || b.mean_min - a.mean_min)
+      .slice(0, topN);
+    const qs = rows.map((r) => r.duration_min).sort((a, b) => a - b);
+    const q5 = quantileSorted(qs, 0.5);
+    const q8 = quantileSorted(qs, 0.8);
+    return rows.map((r) => {
+      let 耗时风险: "低耗时" | "中耗时" | "高耗时" = "低耗时";
+      if (r.duration_min > q8) 耗时风险 = "高耗时";
+      else if (r.duration_min > q5) 耗时风险 = "中耗时";
+      return { ...r, 耗时风险 };
+    });
+  }, [filtered, focusDay, topN]);
 
   const volatilityRows = useMemo(() => {
     if (!filtered.length) return [];
@@ -529,6 +923,53 @@ export default function App() {
     return `${header}\n${body}`;
   }, [volatilityRows]);
 
+  const dayRankPlainText = useMemo(() => {
+    if (!dayRankData.length) return "";
+    const header = `排名\t${focusDay} 最长耗时(分)\t当日均值(分)\t实例数\t分档\tDAG / Task`;
+    const body = dayRankData
+      .map((r, i) =>
+        `${i + 1}\t${r.duration_min.toFixed(2)}\t${r.mean_min.toFixed(2)}\t${r.instances}\t${r.耗时风险}\t${r.dag_task}`,
+      )
+      .join("\n");
+    return `${header}\n${body}`;
+  }, [dayRankData, focusDay]);
+
+  const dagDeltaPlainText = useMemo(() => {
+    if (!dagCompareRows.length) return "";
+    const header = `DAG\t${baselineDay}(分)\t${focusDay}(分)\tΔ分钟\tΔ%\t口径`;
+    const body = dagCompareRows
+      .map(
+        (r) =>
+          `${r.dag_id}\t${r.baseline_min.toFixed(2)}\t${r.today_min.toFixed(2)}\t${r.delta_min.toFixed(2)}\t${r.delta_pct.toFixed(1)}%\t${r.span_source}`,
+      )
+      .join("\n");
+    return `${header}\n${body}`;
+  }, [dagCompareRows, focusDay, baselineDay]);
+
+  const taskDeltaPlainText = useMemo(() => {
+    if (!taskDeltaAttributed.length) return "";
+    const header = `排名\t${baselineDay}(分)\t${focusDay}(分)\tΔ分钟\tΔ%\t判定\t源头Task\t依赖链\tDAG / Task`;
+    const body = taskDeltaAttributed
+      .map(
+        (r, i) =>
+          `${i + 1}\t${r.baseline_min.toFixed(2)}\t${r.today_min.toFixed(2)}\t${r.delta_min.toFixed(2)}\t${r.delta_pct.toFixed(1)}%\t${r.slowdown}\t${r.root_task_id}\t${r.upstream_path}\t${r.dag_task}`,
+      )
+      .join("\n");
+    return `${header}\n${body}`;
+  }, [taskDeltaAttributed, focusDay, baselineDay]);
+
+  const rootSummaryPlainText = useMemo(() => {
+    if (!slowdownRootSummary.length) return "";
+    const header = "源头Task\tDAG\tΔ分钟\t牵连下游数\t下游Task";
+    const body = slowdownRootSummary
+      .map(
+        (r) =>
+          `${r.root_task_id}\t${r.dag_id}\t${r.root_delta_min.toFixed(2)}\t${r.affected_count}\t${r.affected_tasks.slice(0, 8).join(", ")}`,
+      )
+      .join("\n");
+    return `${header}\n${body}`;
+  }, [slowdownRootSummary]);
+
   const barPlainText = useMemo(() => {
     const header = "排名\t平均耗时(分)\t分档\tDAG / Task";
     const body = barData
@@ -602,7 +1043,95 @@ export default function App() {
     return { dag_id, task_id, daily: tail, baseline, today: todayRow, metricLabel };
   }, [filtered, selectedTask, lookbackDays, metricMode]);
 
+  const jumpToTaskCompare = useCallback((dagTask: string) => {
+    setSelectedTask(dagTask);
+    setTab("task");
+  }, []);
+
   const isDark = theme === "dark";
+
+  const dagCompareChart = useMemo(() => {
+    const slowed = dagCompareRows.filter((r) => r.delta_min > 0).slice(0, topN);
+    if (!slowed.length) return null;
+    const rankLabels = slowed.map((_, i) => `#${i + 1}`);
+    const data: Data[] = [
+      {
+        type: "bar",
+        orientation: "h",
+        x: slowed.map((r) => r.delta_min),
+        y: rankLabels,
+        marker: {
+          color: slowed.map((r) => (r.delta_min >= 30 || r.ratio >= 1.5 ? "#dc2626" : r.delta_min >= 10 ? "#f59e0b" : "#6366f1")),
+        },
+        hovertext: slowed.map(
+          (r) =>
+            `${r.dag_id}<br>${baselineDay} ${r.baseline_min.toFixed(2)} 分 → ${focusDay} ${r.today_min.toFixed(2)} 分 · ${r.span_source}`,
+        ),
+        hovertemplate: "%{hovertext}<br>变慢 %{x:.2f} 分钟<extra></extra>",
+      },
+    ];
+    const h = plotHeightHorizontalBars(slowed.length);
+    const layout: Partial<Layout> = {
+      ...chartLayoutBase(isDark, chartMarginsHorizontalBar()),
+      height: h,
+      autosize: false,
+      showlegend: false,
+      xaxis: { ...chartAxisGrid(isDark), title: { text: "较基线日变慢（分钟）", standoff: 10 } },
+      yaxis: {
+        ...chartAxisGrid(isDark),
+        title: { text: "DAG 排名（靠上变慢越多）", standoff: 6 },
+        automargin: true,
+        tickfont: { size: 12 },
+        autorange: "reversed",
+      },
+    };
+    return { data, layout };
+  }, [dagCompareRows, focusDay, baselineDay, topN, isDark]);
+
+  const taskDeltaChart = useMemo(() => {
+    if (!taskDeltaAttributed.length) return null;
+    const slowed = taskDeltaAttributed.filter((r) => r.delta_min > 0);
+    if (!slowed.length) return null;
+    const rankLabels = slowed.map((_, i) => `#${i + 1}`);
+    const colorMap: Record<string, string> = {
+      显著变慢: "#dc2626",
+      轻微变慢: "#f59e0b",
+      持平: "#64748b",
+      变快: "#16a34a",
+      仅今日: "#6366f1",
+      仅基线日: "#64748b",
+    };
+    const data: Data[] = [
+      {
+        type: "bar",
+        orientation: "h",
+        x: slowed.map((r) => r.delta_min),
+        y: rankLabels,
+        marker: { color: slowed.map((r) => colorMap[r.slowdown]) },
+        hovertext: slowed.map(
+          (r) =>
+            `${r.dag_task}<br>${r.slowdown} · ${baselineDay} ${r.baseline_min.toFixed(2)} 分 → ${focusDay} ${r.today_min.toFixed(2)} 分`,
+        ),
+        hovertemplate: "%{hovertext}<br>Δ %{x:.2f} 分钟<extra></extra>",
+      },
+    ];
+    const h = plotHeightHorizontalBars(slowed.length);
+    const layout: Partial<Layout> = {
+      ...chartLayoutBase(isDark, chartMarginsHorizontalBar()),
+      height: h,
+      autosize: false,
+      showlegend: false,
+      xaxis: { ...chartAxisGrid(isDark), title: { text: "较昨日变慢（分钟）", standoff: 10 } },
+      yaxis: {
+        ...chartAxisGrid(isDark),
+        title: { text: "Task 排名（靠上贡献越大）", standoff: 6 },
+        automargin: true,
+        tickfont: { size: 12 },
+        autorange: "reversed",
+      },
+    };
+    return { data, layout };
+  }, [taskDeltaAttributed, focusDay, baselineDay, isDark]);
 
   const volChartFixed = useMemo(() => {
     if (!volatilityRows.length) return null;
@@ -649,6 +1178,46 @@ export default function App() {
     };
     return { data, layout };
   }, [volatilityRows, isDark]);
+
+  const dayRankChart = useMemo(() => {
+    if (!dayRankData.length) return null;
+    const colorMap: Record<string, string> = { 高耗时: "#dc2626", 中耗时: "#f59e0b", 低耗时: "#16a34a" };
+    const bySeverity = [...dayRankData];
+    const rankLabels = bySeverity.map((_, i) => `#${i + 1}`);
+    const data: Data[] = [
+      {
+        type: "bar",
+        orientation: "h",
+        x: bySeverity.map((r) => r.duration_min),
+        y: rankLabels,
+        marker: { color: bySeverity.map((r) => colorMap[r.耗时风险]) },
+        hovertext: bySeverity.map(
+          (r) =>
+            `${r.dag_task}<br>${r.耗时风险} · 最长 ${r.duration_min.toFixed(2)} 分 · 均值 ${r.mean_min.toFixed(2)} 分 · ${r.instances} 次`,
+        ),
+        hovertemplate: "%{hovertext}<extra></extra>",
+      },
+    ];
+    const h = plotHeightHorizontalBars(bySeverity.length);
+    const layout: Partial<Layout> = {
+      ...chartLayoutBase(isDark, chartMarginsHorizontalBar()),
+      height: h,
+      autosize: false,
+      showlegend: false,
+      xaxis: {
+        ...chartAxisGrid(isDark),
+        title: { text: `${focusDay} 最长单次耗时（分钟）`, standoff: 10 },
+      },
+      yaxis: {
+        ...chartAxisGrid(isDark),
+        title: { text: "排名（靠上越慢，第 1 名当日最久）", standoff: 6 },
+        automargin: true,
+        tickfont: { size: 12 },
+        autorange: "reversed",
+      },
+    };
+    return { data, layout };
+  }, [dayRankData, focusDay, isDark]);
 
   const barChart = useMemo(() => {
     const colorMap: Record<string, string> = { 高耗时: "#dc2626", 中耗时: "#f59e0b", 低耗时: "#16a34a" };
@@ -848,7 +1417,7 @@ export default function App() {
                 <span className="app-header__title-pipe">|</span>
                 <span className="app-header__title-muted">Airflow 运维</span>
               </h1>
-              <p className="app-header__sub">对比 DAG/Task 耗时分布与波动，优先收敛高变异、高尾延迟任务。</p>
+              <p className="app-header__sub">发现 DAG 整体变慢时，先看今日 vs 昨日定位拖慢 Task，再下钻单任务历史基线。</p>
             </div>
           </div>
           <div className="header-meta">
@@ -872,7 +1441,8 @@ export default function App() {
         </div>
       ) : null}
 
-      <details className="card card--session" open>
+      <div className="dashboard-frame">
+      <details className="card card--session">
         <summary className="card__head">
           <div>
             <h2 className="card__title">数据源会话</h2>
@@ -1044,41 +1614,53 @@ export default function App() {
           </aside>
 
           <main className="main-panel">
-            <div className="filter-summary">
-              <span>
-                区间 <strong>{startDay}</strong> — <strong>{endDay}</strong>
-              </span>
-              <span>
-                任务实例 <strong>{filtered.length.toLocaleString()}</strong> 条
-              </span>
-            </div>
-            <div className="tab-rail" role="tablist" aria-label="看板分区">
-              {(
-                [
-                  ["overview", "总览", <IconLayoutDashboard key="i" />] as const,
-                  ["task", "单任务对比", <IconActivity key="i" />] as const,
-                  ["anomaly", "异常候选", <IconAlertTriangle key="i" />] as const,
-                  ["detail", "明细与导出", <IconTable key="i" />] as const,
-                ] as const
-              ).map(([k, label, icon]) => (
-                <button
-                  key={k}
-                  type="button"
-                  role="tab"
-                  aria-selected={tab === k}
-                  className={tab === k ? "tab-rail__active" : ""}
-                  onClick={() => setTab(k)}
-                >
-                  {icon}
-                  {label}
-                </button>
-              ))}
+            <div className="main-panel__toolbar">
+              <div className="filter-summary">
+                <span className="filter-summary__item">
+                  区间 <strong>{startDay}</strong> — <strong>{endDay}</strong>
+                </span>
+                {focusDay ? (
+                  <span className="filter-summary__item" title="日环比诊断参考日">
+                    诊断日 <strong>{focusDay}</strong>
+                  </span>
+                ) : null}
+                {baselineDay ? (
+                  <span className="filter-summary__item" title="日环比基线（默认昨日）">
+                    基线 <strong>{baselineDay}</strong>
+                  </span>
+                ) : null}
+                <span className="filter-summary__item">
+                  任务实例 <strong>{filtered.length.toLocaleString()}</strong>
+                </span>
+              </div>
+              <div className="tab-rail" role="tablist" aria-label="看板分区">
+                {(
+                  [
+                    ["overview", "总览", <IconLayoutDashboard key="i" />] as const,
+                    ["task", "单任务对比", <IconActivity key="i" />] as const,
+                    ["anomaly", "异常候选", <IconAlertTriangle key="i" />] as const,
+                    ["detail", "明细与导出", <IconTable key="i" />] as const,
+                  ] as const
+                ).map(([k, label, icon]) => (
+                  <button
+                    key={k}
+                    type="button"
+                    role="tab"
+                    aria-selected={tab === k}
+                    className={tab === k ? "tab-rail__active" : ""}
+                    onClick={() => setTab(k)}
+                  >
+                    {icon}
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
 
+            <div className="main-panel__body">
             {tab === "overview" && filtered.length ? (
               <section className="content-section">
-                <span className="section-chip">Overview</span>
-                <div className="panel-title">核心指标与优化优先级</div>
+                <h2 className="subsection-title subsection-title--first">核心指标</h2>
                 <div className="stat-grid">
                   <StatCard
                     label="任务实例"
@@ -1105,7 +1687,369 @@ export default function App() {
                     watermarkIcon={<IconChartBar />}
                   />
                 </div>
-                <h3 className="subsection-title">波动最大的 Task</h3>
+
+                <h2 className="subsection-title">今日 vs 昨日 · 调度变慢诊断</h2>
+                <p className="section-note section-note--tight">
+                  先看 DAG 是否整体变长，再沿依赖链定位变慢源头；点击表格行可下钻单任务对比。
+                </p>
+                {focusDay && baselineDay && (dagCompareRows.length || taskDeltaAttributed.length) ? (
+                  <>
+                    <div className="stat-grid stat-grid--3" style={{ marginBottom: "0.85rem" }}>
+                      <StatCard
+                        label="整体变慢的 DAG"
+                        value={dagCompareRows.filter((r) => r.delta_min > 0).length}
+                        smallIcon={<IconLayers />}
+                        watermarkIcon={<IconLayers />}
+                      />
+                      <StatCard
+                        label="显著变慢 Task"
+                        value={taskDeltaAttributed.filter((r) => r.slowdown === "显著变慢").length}
+                        smallIcon={<IconAlertTriangle />}
+                        watermarkIcon={<IconAlertTriangle />}
+                      />
+                      <StatCard
+                        label="DAG 最大变慢"
+                        value={
+                          dagCompareRows[0]
+                            ? `${dagCompareRows[0].delta_min >= 0 ? "+" : ""}${dagCompareRows[0].delta_min.toFixed(1)} 分`
+                            : "—"
+                        }
+                        smallIcon={<IconClock />}
+                        watermarkIcon={<IconClock />}
+                      />
+                    </div>
+                    {dagCompareRows.length ? (
+                      <>
+                        <h4 className="inner-heading">DAG 整体耗时对比</h4>
+                        <p className="section-note section-note--tight">
+                          优先用 Task <strong>起止时间</strong>估算墙钟跨度；缺字段时回退为 Task 均值合计。
+                        </p>
+                        <div className="split-panel split-panel--chart-wide">
+                          <div className="table-wrap table-wrap--wide table-wrap--sm">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>DAG</th>
+                                <th>{baselineDay}(分)</th>
+                                <th>{focusDay}(分)</th>
+                                <th>Δ 分钟</th>
+                                <th>Δ%</th>
+                                <th>口径</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {dagCompareRows.slice(0, topN).map((r) => (
+                                <tr key={r.dag_id}>
+                                  <td>{r.dag_id}</td>
+                                  <td>{r.baseline_min.toFixed(2)}</td>
+                                  <td>{r.today_min.toFixed(2)}</td>
+                                  <td className={r.delta_min > 0 ? "cell-warn" : r.delta_min < 0 ? "cell-ok" : ""}>
+                                    {r.delta_min >= 0 ? "+" : ""}
+                                    {r.delta_min.toFixed(2)}
+                                  </td>
+                                  <td>
+                                    {r.delta_pct >= 0 ? "+" : ""}
+                                    {r.delta_pct.toFixed(1)}%
+                                  </td>
+                                  <td>{r.span_source}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          </div>
+                          {dagCompareChart ? (
+                            <div className="chart-shell chart-shell--embedded">
+                              <div className="chart-shell__meta">
+                                <h3 className="chart-shell__title">DAG 变慢 Top</h3>
+                              </div>
+                              <div className="chart-shell__plot">
+                                <Plot
+                                  data={dagCompareChart.data}
+                                  layout={dagCompareChart.layout}
+                                  style={{
+                                    width: "100%",
+                                    height:
+                                      typeof dagCompareChart.layout.height === "number" ? dagCompareChart.layout.height : 280,
+                                  }}
+                                  useResizeHandler={false}
+                                  config={{ responsive: true, displaylogo: false }}
+                                />
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                        <CopyPlainBlock
+                          label="DAG 对比（制表符分隔）"
+                          text={dagDeltaPlainText}
+                          toastMsg="已复制 DAG 对比表"
+                          onCopy={copyPlain}
+                        />
+                      </>
+                    ) : null}
+                    {taskDeltaAttributed.length ? (
+                      <>
+                        <h4 className="inner-heading">变慢源头（依赖链追溯）</h4>
+                        <p className="section-note section-note--tight">
+                          依赖来源：<strong>{depSourceHint}</strong>。上游传导 vs 自身变慢。
+                        </p>
+                        {slowdownRootSummary.length ? (
+                          <div className="table-wrap table-wrap--wide table-wrap--clickable table-wrap--sm">
+                            <table>
+                              <thead>
+                                <tr>
+                                  <th>源头 Task</th>
+                                  <th>DAG</th>
+                                  <th>源头 Δ 分钟</th>
+                                  <th>牵连下游</th>
+                                  <th>典型下游 Task</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {slowdownRootSummary.slice(0, topN).map((r) => (
+                                  <tr
+                                    key={`${r.dag_id}-${r.root_task_id}`}
+                                    className="table-row--action"
+                                    title="点击跳转单任务对比"
+                                    onClick={() => jumpToTaskCompare(r.root_dag_task)}
+                                  >
+                                    <td>
+                                      <strong>{r.root_task_id}</strong>
+                                    </td>
+                                    <td>{r.dag_id}</td>
+                                    <td className="cell-warn">+{r.root_delta_min.toFixed(2)}</td>
+                                    <td>{r.affected_count}</td>
+                                    <td style={{ fontSize: "0.78rem" }}>
+                                      {r.affected_tasks.length
+                                        ? r.affected_tasks.slice(0, 4).join("、") +
+                                          (r.affected_tasks.length > 4 ? "…" : "")
+                                        : "—"}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <p className="section-note" style={{ marginBottom: "0.85rem" }}>
+                            当前 Top 列表中未识别到明显变慢源头（Δ 均较小）。
+                          </p>
+                        )}
+                        {rootSummaryPlainText ? (
+                          <CopyPlainBlock
+                            label="变慢源头榜（制表符分隔）"
+                            text={rootSummaryPlainText}
+                            toastMsg="已复制变慢源头榜"
+                            onCopy={copyPlain}
+                          />
+                        ) : null}
+                        <h4 className="inner-heading">变慢 Task 明细</h4>
+                        <div className="table-wrap table-wrap--wide table-wrap--clickable table-wrap--full">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>#</th>
+                                <th>DAG / Task</th>
+                                <th>Δ 分钟</th>
+                                <th>源头 Task</th>
+                                <th>依赖链</th>
+                                <th>判定</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {taskDeltaAttributed.map((r, i) => (
+                                <tr
+                                  key={`${r.dag_id}-${r.task_id}`}
+                                  className="table-row--action"
+                                  title="点击跳转单任务对比"
+                                  onClick={() => jumpToTaskCompare(r.dag_task)}
+                                >
+                                  <td>{i + 1}</td>
+                                  <td className="cell-task">{r.dag_task}</td>
+                                  <td className={r.delta_min > 0 ? "cell-warn" : r.delta_min < 0 ? "cell-ok" : ""}>
+                                    {r.delta_min >= 0 ? "+" : ""}
+                                    {r.delta_min.toFixed(2)}
+                                  </td>
+                                  <td>
+                                    {r.root_task_id === r.task_id ? (
+                                      <strong>{r.root_task_id}</strong>
+                                    ) : (
+                                      r.root_task_id
+                                    )}
+                                  </td>
+                                  <td className="cell-path">{r.upstream_path}</td>
+                                  <td>
+                                    <span
+                                      className={`risk-pill risk-pill--${
+                                        r.root_reason === "自身变慢" ? "high" : "mid"
+                                      }`}
+                                    >
+                                      {r.root_reason}
+                                    </span>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        {taskDeltaChart ? (
+                          <div className="chart-shell chart-shell--embedded chart-shell--below-table">
+                            <div className="chart-shell__meta">
+                              <h3 className="chart-shell__title">Task 变慢 Top（Δ 分钟）</h3>
+                            </div>
+                            <div className="chart-shell__plot">
+                              <Plot
+                                data={taskDeltaChart.data}
+                                layout={taskDeltaChart.layout}
+                                style={{
+                                  width: "100%",
+                                  height:
+                                    typeof taskDeltaChart.layout.height === "number" ? taskDeltaChart.layout.height : 280,
+                                }}
+                                useResizeHandler={false}
+                                config={{ responsive: true, displaylogo: false }}
+                              />
+                            </div>
+                          </div>
+                        ) : null}
+                        <CopyPlainBlock
+                          label="Task 变慢榜（制表符分隔）"
+                          text={taskDeltaPlainText}
+                          toastMsg="已复制 Task 变慢榜"
+                          onCopy={copyPlain}
+                        />
+                        {!taskDeltaChart ? (
+                          <p className="section-note">两日均有数据的 Task 未出现较基线日变慢项。</p>
+                        ) : null}
+                      </>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="section-note">无法完成日环比：请确认 fact 中含前一日数据，或扩大 COLLECT_DAYS。</p>
+                )}
+
+                <details className="fold-section">
+                  <summary className="fold-section__summary">当日绝对耗时排行</summary>
+                  <div className="fold-section__content">
+                {dayRankData.length ? (
+                  <>
+                    <div className="stat-grid stat-grid--3" style={{ marginBottom: "0.85rem" }}>
+                      <StatCard
+                        label={`${focusDay} 最慢 Task`}
+                        value={dayRankData[0].duration_min.toFixed(2)}
+                        smallIcon={<IconClock />}
+                        watermarkIcon={<IconClock />}
+                      />
+                      <StatCard
+                        label="Top 1 任务"
+                        value={
+                          <span style={{ fontSize: "0.82rem", lineHeight: 1.35, wordBreak: "break-all" }}>
+                            {dayRankData[0].task_id}
+                          </span>
+                        }
+                        smallIcon={<IconActivity />}
+                        watermarkIcon={<IconActivity />}
+                      />
+                      <StatCard
+                        label={`≥30 分钟 Task 数`}
+                        value={dayRankData.filter((r) => r.duration_min >= 30).length}
+                        smallIcon={<IconAlertTriangle />}
+                        watermarkIcon={<IconAlertTriangle />}
+                      />
+                    </div>
+                    <div className="table-wrap" style={{ maxHeight: 280, marginBottom: "0.85rem" }}>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>#</th>
+                            <th>DAG</th>
+                            <th>Task</th>
+                            <th>最长(分)</th>
+                            <th>均值(分)</th>
+                            <th>次数</th>
+                            <th>分档</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {dayRankData.map((r, i) => (
+                            <tr key={`${r.dag_id}-${r.task_id}`}>
+                              <td>{i + 1}</td>
+                              <td>{r.dag_id}</td>
+                              <td>{r.task_id}</td>
+                              <td>{r.duration_min.toFixed(2)}</td>
+                              <td>{r.mean_min.toFixed(2)}</td>
+                              <td>{r.instances}</td>
+                              <td>
+                                <span
+                                  className={`risk-pill risk-pill--${
+                                    r.耗时风险 === "高耗时" ? "high" : r.耗时风险 === "中耗时" ? "mid" : "low"
+                                  }`}
+                                >
+                                  {r.耗时风险}
+                                </span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    {dayRankChart ? (
+                      <div className="chart-shell">
+                        <div className="chart-shell__meta">
+                          <h3 className="chart-shell__title">
+                            {focusDay} 任务耗时 Top {dayRankData.length}（倒序）
+                          </h3>
+                          <p className="chart-shell__lede">
+                            <strong>第 1 名在最上方</strong>，表示当日该 Task 单次运行最久；颜色为 Top N 内部分档。完整名称见下方文本框。
+                          </p>
+                          <ul className="chart-shell__legend" aria-label="耗时分档颜色">
+                            <li>
+                              <span className="chart-shell__swatch chart-shell__swatch--high" /> 高耗时档
+                            </li>
+                            <li>
+                              <span className="chart-shell__swatch chart-shell__swatch--mid" /> 中耗时档
+                            </li>
+                            <li>
+                              <span className="chart-shell__swatch chart-shell__swatch--low" /> 低耗时档
+                            </li>
+                          </ul>
+                          <details className="chart-shell__more">
+                            <summary>计算说明（展开）</summary>
+                            <p className="chart-shell__desc chart-shell__desc--tight">
+                              仅统计参考日 <strong>{focusDay}</strong> 的实例；同一 DAG+Task 若有多条记录，取<strong>最长单次</strong>参与排序，展示 Top{" "}
+                              <strong>{topN}</strong>。分档按榜单内部中位与 80% 分位划分。
+                            </p>
+                          </details>
+                        </div>
+                        <div className="chart-shell__plot">
+                          <Plot
+                            data={dayRankChart.data}
+                            layout={dayRankChart.layout}
+                            style={{
+                              width: "100%",
+                              height: typeof dayRankChart.layout.height === "number" ? dayRankChart.layout.height : 280,
+                            }}
+                            useResizeHandler={false}
+                            config={{ responsive: true, displaylogo: false }}
+                          />
+                        </div>
+                        <CopyPlainBlock
+                          label="完整名称（制表符分隔）"
+                          text={dayRankPlainText}
+                          toastMsg="已复制当日耗时榜单（含表头）"
+                          onCopy={copyPlain}
+                        />
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="section-note">参考日 {focusDay || "—"} 无匹配任务实例。</p>
+                )}
+                  </div>
+                </details>
+
+                <details className="fold-section">
+                  <summary className="fold-section__summary">波动最大的 Task</summary>
+                  <div className="fold-section__content">
                 <div className="range-row">
                   <div className="range-row__top">
                     <span className="range-label">统计窗口（天）</span>
@@ -1220,38 +2164,29 @@ export default function App() {
                             config={{ responsive: true, displaylogo: false }}
                           />
                         </div>
-                        <div className="chart-shell__copyblock">
-                          <div className="chart-shell__copyhead">
-                            <span className="chart-shell__copylabel">完整名称（制表符分隔，可粘贴到 Excel）</span>
-                            <button
-                              type="button"
-                              className="btn-ghost btn-ghost--sm chart-shell__copybtn"
-                              onClick={() => void copyPlain(volPlainText, "已复制波动榜单（含表头）")}
-                            >
-                              复制全部
-                            </button>
-                          </div>
-                          <textarea
-                            className="chart-shell__copyarea"
-                            readOnly
-                            rows={Math.min(14, Math.max(4, volatilityRows.length))}
-                            value={volPlainText}
-                            aria-label="波动榜单全文，可选中复制"
-                          />
-                        </div>
+                        <CopyPlainBlock
+                          label="完整名称（制表符分隔，可粘贴到 Excel）"
+                          text={volPlainText}
+                          toastMsg="已复制波动榜单（含表头）"
+                          onCopy={copyPlain}
+                        />
                       </div>
                     ) : null}
                   </>
                 ) : (
-                  <p className="section-note" style={{ marginTop: "0.75rem" }}>
-                    可尝试降低「最少有效天数」以纳入更多 Task。
-                  </p>
+                  <p className="section-note">可尝试降低「最少有效天数」以纳入更多 Task。</p>
                 )}
+                  </div>
+                </details>
+
+                <details className="fold-section">
+                  <summary className="fold-section__summary">趋势与区间分析</summary>
+                  <div className="fold-section__content">
                 <div className="chart-shell">
                   <div className="chart-shell__meta">
-                    <h3 className="chart-shell__title">平均单次耗时最高的 Task（Top {barData.length}）</h3>
+                    <h3 className="chart-shell__title">区间内平均耗时最高的 Task（Top {barData.length}）</h3>
                     <p className="chart-shell__lede">
-                      <strong>第 1 名在最上方</strong>（平均耗时最长）；颜色为当前 Top N <strong>内部</strong>分档。完整 DAG/Task 见下方文本框。
+                      对<strong>整个筛选区间</strong>内每次实例取算术平均；<strong>第 1 名在最上方</strong>。与上方「当日排行」互补：一个看绝对慢、一个看区间均值。
                     </p>
                     <ul className="chart-shell__legend" aria-label="耗时分档颜色">
                       <li>
@@ -1284,25 +2219,12 @@ export default function App() {
                       config={{ responsive: true, displaylogo: false }}
                     />
                   </div>
-                  <div className="chart-shell__copyblock">
-                    <div className="chart-shell__copyhead">
-                      <span className="chart-shell__copylabel">完整名称（制表符分隔）</span>
-                      <button
-                        type="button"
-                        className="btn-ghost btn-ghost--sm chart-shell__copybtn"
-                        onClick={() => void copyPlain(barPlainText, "已复制耗时榜单（含表头）")}
-                      >
-                        复制全部
-                      </button>
-                    </div>
-                    <textarea
-                      className="chart-shell__copyarea"
-                      readOnly
-                      rows={Math.min(14, Math.max(4, barData.length))}
-                      value={barPlainText}
-                      aria-label="平均耗时榜单全文，可选中复制"
-                    />
-                  </div>
+                  <CopyPlainBlock
+                    label="完整名称（制表符分隔）"
+                    text={barPlainText}
+                    toastMsg="已复制耗时榜单（含表头）"
+                    onCopy={copyPlain}
+                  />
                 </div>
                 <div className="chart-shell">
                   <div className="chart-shell__meta">
@@ -1325,24 +2247,17 @@ export default function App() {
                     />
                   </div>
                 </div>
+                  </div>
+                </details>
               </section>
             ) : null}
 
             {tab === "task" && filtered.length ? (
               <section className="content-section">
-                <h3 className="subsection-title">单日对比历史基线</h3>
+                <h2 className="subsection-title subsection-title--first">单日对比历史基线</h2>
+                <p className="section-note section-note--tight">选定 Task 后查看近几日趋势与基线告警。</p>
                 <label className="form-label">Task</label>
-                <select
-                  value={selectedTask}
-                  onChange={(e) => setSelectedTask(e.target.value)}
-                  style={{ marginBottom: "0.75rem" }}
-                >
-                  {taskOptions.map((t) => (
-                    <option key={t} value={t}>
-                      {t}
-                    </option>
-                  ))}
-                </select>
+                <TaskSearchSelect options={taskOptions} value={selectedTask} onChange={setSelectedTask} />
                 <div className="range-row">
                   <div className="range-row__top">
                     <span className="range-label">对比回溯天数</span>
@@ -1444,7 +2359,10 @@ export default function App() {
 
             {tab === "anomaly" && filtered.length ? (
               <section className="content-section">
-                <h3 className="subsection-title">超过全局 95% 分位的异常候选</h3>
+                <h2 className="subsection-title subsection-title--first">异常候选</h2>
+                <p className="section-note section-note--tight">
+                  超过全局 95% 分位（{p95Threshold.toFixed(2)} 分）的 Task 实例。
+                </p>
                 <div className="stat-grid stat-grid--2">
                   <StatCard
                     label="95% 分位（分）"
@@ -1498,7 +2416,8 @@ export default function App() {
 
             {tab === "detail" && filtered.length ? (
               <section className="content-section">
-                <h3 className="subsection-title">明细</h3>
+                <h2 className="subsection-title subsection-title--first">明细与导出</h2>
+                <p className="section-note section-note--tight">共 {filteredDisplay.length.toLocaleString()} 条筛选结果。</p>
                 <button
                   type="button"
                   className="btn-primary"
@@ -1513,7 +2432,7 @@ export default function App() {
                 >
                   下载筛选结果 CSV
                 </button>
-                <div className="table-wrap table-wrap--viewport">
+                <div className="table-wrap table-wrap--viewport table-wrap--wide">
                   <table>
                     <thead>
                       <tr>
@@ -1547,10 +2466,12 @@ export default function App() {
                 </div>
               </section>
             ) : null}
+            </div>
           </main>
         </div>
         </>
       ) : null}
+      </div>
     </div>
   );
 }
